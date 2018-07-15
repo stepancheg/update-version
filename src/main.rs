@@ -45,10 +45,12 @@ pub enum TomlDependency {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 struct TomlManifest {
     package: Option<TomlPackage>,
     workspace: Option<TomlWorkspace>,
     dependencies: Option<BTreeMap<String, TomlDependency>>,
+    dev_dependencies: Option<BTreeMap<String, TomlDependency>>,
 }
 
 
@@ -123,10 +125,15 @@ fn topo_sort(members: &mut [ParsedMember]) {
 }
 
 
-fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str) {
+fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbose: bool) {
     let mut manifest_path = repo_root.to_owned();
     manifest_path.push(&member.member);
     manifest_path.push("Cargo.toml");
+
+    if verbose {
+        println!("patching {}", manifest_path.display());
+        println!("{:?}", member);
+    }
 
     let read = File::open(&manifest_path).expect(&format!("open manifest {:?}", manifest_path));
     let read = BufReader::new(read);
@@ -153,7 +160,7 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str) {
 
         if line == "[package]" {
             where_we_are = WhereWeAre::Package;
-        } else if line == "[dependencies]" {
+        } else if line == "[dependencies]" || line == "[dev-dependencies]" {
             where_we_are = WhereWeAre::Dependencies;
         } else if line.starts_with("[") {
             where_we_are = WhereWeAre::Other;
@@ -201,7 +208,12 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str) {
 
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut verbose = false;
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.len() > 0 && args[0] == "--verbose" {
+        verbose = true;
+        args.remove(0);
+    }
     assert_eq!(1, args.len());
     let new_version = &args[0];
 
@@ -214,11 +226,14 @@ fn main() {
     for member in members {
         let mut crate_path = repo_root.to_owned();
         crate_path.push(&member);
+        if verbose {
+            println!("processing crate {}", crate_path.display());
+        }
         let manifest = read_crate_manifest(&crate_path);
         let package = manifest.package
             .expect(&format!("package in {}", member));
-        let dependencies = manifest.dependencies
-            .expect(&format!("dependencies in {}", member));
+        let dependencies = manifest.dependencies.unwrap_or_default();
+        let dev_dependencies = manifest.dev_dependencies.unwrap_or_default();
         if package.publish == Some(false) {
             continue;
         }
@@ -226,14 +241,14 @@ fn main() {
             panic!("version must be 0.0.0 is !publish for {}", member);
         }
         if package.version == "0.1.0" {
-            panic!("default version 1.0.0 in {}", member);
+            panic!("default version 0.1.0 in {}", member);
         }
 
         let name = package.name;
 
         let mut internal_deps = Vec::new();
 
-        for (name, dep) in dependencies {
+        for (name, dep) in dependencies.into_iter().chain(dev_dependencies) {
             if let TomlDependency::Detailed(d) = dep {
                 let path = match d.path {
                     Some(path) => path,
@@ -262,11 +277,12 @@ fn main() {
     topo_sort(&mut publish_members);
 
     for member in &publish_members {
-        patch_crate(&repo_root, member, new_version);
+        patch_crate(&repo_root, member, new_version, verbose);
     }
 
+    println!("git commit -a -m 'Bump version'");
+    println!("git tag v{}", new_version);
     for member in &publish_members {
         println!("cargo publish --manifest-path={}/Cargo.toml", member.member);
     }
-    println!("git tag v{}", new_version);
 }
