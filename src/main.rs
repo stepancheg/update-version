@@ -243,7 +243,8 @@ fn main() {
                     },
                 };
                 let version = d.version.expect(&format!("version in dep of {}", member));
-                assert!(version.starts_with("="), "dep version must start with =: {}", member);
+                assert!(version.starts_with("="),
+                    "dep {} version in file {} must start with =", name, crate_path.display());
                 internal_deps.push(ParsedDependency {
                     name,
                     path,
