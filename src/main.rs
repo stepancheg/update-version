@@ -280,9 +280,11 @@ fn main() {
         patch_crate(&repo_root, member, new_version, verbose);
     }
 
-    println!("git commit -a -m 'Bump version'");
+    println!("git commit -a -m 'Bump version to {}'", new_version);
     println!("git tag v{}", new_version);
     for member in &publish_members {
         println!("cargo publish --manifest-path={}/Cargo.toml", member.member);
     }
+    println!("git push");
+    println!("git push --tags");
 }
