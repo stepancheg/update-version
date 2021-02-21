@@ -1,16 +1,15 @@
-use std::env;
-use std::path::PathBuf;
-use std::fs;
-use std::path::Path;
 use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufReader;
-use std::io::BufRead;
+use std::env;
 use std::fmt::Write as fmt_Write;
+use std::fs;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::path::Path;
+use std::path::PathBuf;
 
-extern crate tempdir;
 extern crate regex;
+extern crate tempdir;
 
 extern crate toml;
 
@@ -34,7 +33,8 @@ struct TomlPackage {
 #[serde(rename_all = "kebab-case")]
 pub struct DetailedTomlDependency {
     version: Option<String>,
-    path: Option<String>
+    path: Option<String>,
+    default_features: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -52,7 +52,6 @@ struct TomlManifest {
     dependencies: Option<BTreeMap<String, TomlDependency>>,
     dev_dependencies: Option<BTreeMap<String, TomlDependency>>,
 }
-
 
 fn find_repo_root() -> PathBuf {
     let candidates = &[".", ".."];
@@ -78,21 +77,22 @@ fn read_crate_manifest(crate_path: &Path) -> TomlManifest {
 
     let content = fs::read_to_string(&cargo_toml).expect(&format!("read {:?}", cargo_toml));
 
-    toml::from_str(&content)
-        .expect(&format!("parse toml {:?}", cargo_toml))
+    toml::from_str(&content).expect(&format!("parse toml {:?}", cargo_toml))
 }
 
 fn find_workspace_members(repo_root: &Path) -> Vec<String> {
-    read_crate_manifest(repo_root).workspace.expect("workspace").members
+    read_crate_manifest(repo_root)
+        .workspace
+        .expect("workspace")
+        .members
 }
-
 
 #[derive(Debug)]
 struct ParsedDependency {
     name: String,
     path: String,
+    default_features: Option<bool>,
 }
-
 
 #[derive(Debug)]
 struct ParsedMember {
@@ -104,7 +104,6 @@ struct ParsedMember {
     internal_deps: Vec<ParsedDependency>,
 }
 
-
 fn topo_sort(members: &mut [ParsedMember]) {
     'again: loop {
         for i in 0..members.len() {
@@ -113,7 +112,11 @@ fn topo_sort(members: &mut [ParsedMember]) {
                     continue;
                 }
 
-                if members[i].internal_deps.iter().any(|d| d.name == members[j].name) {
+                if members[i]
+                    .internal_deps
+                    .iter()
+                    .any(|d| d.name == members[j].name)
+                {
                     members.swap(i, j);
                     // Native algorithm
                     continue 'again;
@@ -123,7 +126,6 @@ fn topo_sort(members: &mut [ParsedMember]) {
         break;
     }
 }
-
 
 fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbose: bool) {
     let mut manifest_path = repo_root.to_owned();
@@ -151,7 +153,6 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbo
     let mut output = String::new();
 
     let mut version_patched = false;
-    let mut internal_deps_seen = HashSet::new();
 
     for line in read.lines() {
         let line = line.expect("line");
@@ -160,7 +161,10 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbo
 
         if line == "[package]" {
             where_we_are = WhereWeAre::Package;
-        } else if line == "[dependencies]" || line == "[dev-dependencies]" {
+        } else if line == "[dependencies]"
+            || line == "[dev-dependencies]"
+            || line == "[build-dependencies]"
+        {
             where_we_are = WhereWeAre::Dependencies;
         } else if line.starts_with("[") {
             where_we_are = WhereWeAre::Other;
@@ -178,14 +182,19 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbo
                 WhereWeAre::Dependencies => {
                     for dep in &member.internal_deps {
                         if line.starts_with(&format!("{} ", dep.name)) {
-                            let inserted = internal_deps_seen.insert(dep.name.clone());
-                            assert!(inserted, "dep more than once in {}", member.name);
-
                             writeln!(
                                 output,
-                                "{} = {{ path = \"{}\", version = \"={}\" }}",
-                                dep.name, dep.path, new_version)
-                                .expect("write");
+                                "{} = {{ path = \"{}\", version = \"={}\"{} }}",
+                                dep.name,
+                                dep.path,
+                                new_version,
+                                match dep.default_features {
+                                    None => "".to_owned(),
+                                    Some(default_features) =>
+                                        format!(", default-features = {}", default_features),
+                                }
+                            )
+                            .expect("write");
                             line_written = true;
                             break;
                         }
@@ -201,11 +210,9 @@ fn patch_crate(repo_root: &Path, member: &ParsedMember, new_version: &str, verbo
     }
 
     assert!(version_patched, "in {}", member.name);
-    assert_eq!(member.internal_deps.len(), internal_deps_seen.len(), "in {}", member.name);
 
     fs::write(&manifest_path, &output).expect("write patched manifest back");
 }
-
 
 fn main() {
     let mut verbose = false;
@@ -230,8 +237,7 @@ fn main() {
             println!("processing crate {}", crate_path.display());
         }
         let manifest = read_crate_manifest(&crate_path);
-        let package = manifest.package
-            .expect(&format!("package in {}", member));
+        let package = manifest.package.expect(&format!("package in {}", member));
         let dependencies = manifest.dependencies.unwrap_or_default();
         let dev_dependencies = manifest.dev_dependencies.unwrap_or_default();
         if package.publish == Some(false) {
@@ -254,15 +260,20 @@ fn main() {
                     Some(path) => path,
                     None => {
                         // Not internal dependency
-                        continue
-                    },
+                        continue;
+                    }
                 };
                 let version = d.version.expect(&format!("version in dep of {}", member));
-                assert!(version.starts_with("="),
-                    "dep {} version in file {} must start with =", name, crate_path.display());
+                assert!(
+                    version.starts_with("="),
+                    "dep {} version in file {} must start with =",
+                    name,
+                    crate_path.display()
+                );
                 internal_deps.push(ParsedDependency {
                     name,
                     path,
+                    default_features: d.default_features,
                 });
             }
         }
